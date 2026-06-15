@@ -1,0 +1,30 @@
+# Données générées
+data/*.csv
+data/*.parquet
+data/database/
+
+# Environnement Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Variables d'environnement et secrets
+.env
+.env.*
+*.key
+
+# IDE
+.vscode/
+.idea/
+
+# Tests et cache
+.pytest_cache/
+.coverage
+htmlcov/
+
+# OS
+.DS_Store
+Thumbs.db
