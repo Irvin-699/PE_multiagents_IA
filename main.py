@@ -144,25 +144,48 @@ def build_graph():
     Retourne un objet compatible avec l'interface graph.invoke(state)
     attendue par app.py.
 
-    Utilise asyncio pour la parallélisation interne tout en exposant
-    une interface synchrone simple.
+    ⚠️ IMPORTANT : on n'utilise JAMAIS la boucle asyncio de Streamlit
+    (asyncio.get_event_loop() / nest_asyncio). Cette boucle appartient
+    au serveur Streamlit et peut être fermée entre deux reruns du script,
+    ce qui provoque un crash "RuntimeError: Event loop is closed".
+
+    À la place, on exécute le pipeline dans un THREAD SÉPARÉ avec sa
+    PROPRE boucle asyncio isolée, créée et détruite à chaque appel.
+    C'est plus sûr et ça fonctionne identiquement en script direct,
+    notebook, ou Streamlit.
     """
+    import threading
+
     class AsyncGraph:
         def invoke(self, initial_state: dict) -> dict:
-            """Lance le pipeline asynchrone depuis un contexte synchrone."""
-            try:
-                # Si une boucle asyncio tourne déjà (ex: Jupyter, Streamlit)
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    # Streamlit tourne dans une boucle — utiliser nest_asyncio
-                    import nest_asyncio
-                    nest_asyncio.apply()
-                    return loop.run_until_complete(_run_pipeline(initial_state))
-                else:
-                    return loop.run_until_complete(_run_pipeline(initial_state))
-            except RuntimeError:
-                # Pas de boucle existante — en créer une nouvelle
-                return asyncio.run(_run_pipeline(initial_state))
+            """
+            Lance le pipeline asynchrone dans un thread isolé avec sa
+            propre boucle d'événements, puis attend le résultat.
+            """
+            result_container: dict = {}
+            error_container:  list = []
+
+            def _thread_target():
+                # Nouvelle boucle asyncio dédiée à ce thread uniquement
+                new_loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(new_loop)
+                try:
+                    result_container["value"] = new_loop.run_until_complete(
+                        _run_pipeline(initial_state)
+                    )
+                except Exception as e:
+                    error_container.append(e)
+                finally:
+                    new_loop.close()
+
+            worker = threading.Thread(target=_thread_target, daemon=True)
+            worker.start()
+            worker.join()
+
+            if error_container:
+                raise error_container[0]
+
+            return result_container.get("value", {})
 
     return AsyncGraph()
 
