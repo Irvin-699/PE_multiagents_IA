@@ -43,10 +43,9 @@ Recommandation personnalisée (Markdown)
 
 L'utilisateur répond à 10 questions via `app.py` :
 
-- Âge, situation professionnelle, revenus
 - Horizon d'investissement (court / moyen / long / très long)
 - Tolérance au risque (score 1–10)
-- Objectif financier (épargne de précaution, croissance, retraite…)
+- Objectif financier
 - Connaissance des marchés et des classes d'actifs
 - Préférences ESG
 
