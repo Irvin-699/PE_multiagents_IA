@@ -9,6 +9,15 @@ import time
 from pathlib import Path
 from dotenv import load_dotenv
 
+# Console Windows en cp1252 : sans cela, le premier caractère non-ASCII
+# imprimé (flèches, accents) lève UnicodeEncodeError et tue le pipeline.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
 load_dotenv()
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -92,7 +101,8 @@ try:
     # Exécute ensuite sur tous les ETFs pour remplir l'état
     print(f"\n  Analyse de tous les ETFs (peut prendre 1-2 min)...")
     state["assets"] = list(state["market_data"]["tickers"])
-    state["user_profile"] = {"horizon": "medium", "risk_score": 5, "goal": "Croissance équilibrée"}
+    state["user_profile"] = {"profil": "Équilibré", "horizon": "medium",
+                             "risk_score": 5, "goal": "Croissance équilibrée"}
     state.update(fundamental_node(state))
     check("macro_context dans state", "macro_context" in state, True)
     print(f"  Durée : {time.time() - t0:.1f}s")
@@ -130,13 +140,12 @@ except Exception as e:
 section("AGENT 5 — Portfolio Manager")
 t0 = time.time()
 
-from agents.portfolio import PortfolioManagerAgent
+from agents.portfolio import portfolio_node
 
 try:
-    agent = PortfolioManagerAgent()
-    result = agent.generate_recommendation(state)
+    state.update(portfolio_node(state))
 
-    alloc = result.get("final_allocation", {})
+    alloc = state.get("portfolio_allocation", {})
     total = sum(alloc.values())
     check("Allocation générée",   len(alloc),          len(alloc) > 0)
     check("Somme = 100%",         f"{total:.1f}%",     abs(total - 100) < 1.0)
@@ -147,7 +156,7 @@ try:
         print(f"    {asset:<26} {pct:5.1f}%  {bar}")
 
     print(f"\n  Extrait recommandation :")
-    print("  " + result["portfolio_decision"][:300].replace("\n", "\n  ") + "...")
+    print("  " + state.get("final_recommendation", "")[:300].replace("\n", "\n  ") + "...")
     print(f"\n  Durée : {time.time() - t0:.1f}s")
 except Exception as e:
     print(f"  [ECHEC] Agent 5 : {e}")

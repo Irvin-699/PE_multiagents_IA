@@ -1,32 +1,39 @@
 """
 agents/fundamental.py
-Agent 2 — Analyste Macro-Économique
+Agent 2 — Analyste Macro-Économique (version asynchrone)
 
 Pipeline :
-    1. Collecte    → Finnhub + NewsAPI (actualités brutes)
-    2. Filtrage    → FinBERT (score sentiment rapide sur tous les articles)
-    3. Stockage    → ChromaDB (vectorisation + persistance)
-    4. Analyse     → Claude Haiku (analyse des 5 meilleurs articles)
+    1. Collecte    → Finnhub (1 seul appel global) + NewsAPI (10 appels parallèles)
+    2. Filtrage    → FinBERT (un seul batch pour tous les ETF, modèle partagé)
+    3. Stockage    → ChromaDB (vectorisation + persistance — relu par l'Agent 3)
+    4. Analyse     → Claude Haiku (10 appels parallèles via AsyncAnthropic)
     5. Score       → Score macro -1 à +1 par ETF → AgentState
 
-LLM : Claude 3.5 Haiku (~5€/mois)
+Parallélisation :
+    Les 10 ETF sont traités en concurrent (asyncio.gather + httpx.AsyncClient).
+    Le nœud LangGraph reste synchrone : il crée sa propre boucle asyncio via
+    asyncio.run(), ce qui est sûr car main.py l'exécute dans un thread
+    d'executor qui ne possède pas de boucle.
 """
 
 import os
-import time
+import re
+import asyncio
 import logging
 import hashlib
 from datetime import datetime, timedelta
 
-import requests
+import httpx
 import chromadb
-from anthropic import Anthropic
-from transformers import pipeline
+from anthropic import AsyncAnthropic
 from dotenv import load_dotenv
 
-from core.state import AgentState
+load_dotenv()   # AVANT tout os.getenv
 
-load_dotenv()
+from core.state import AgentState
+from core.config import CHROMA_PATH, HTTP_TIMEOUT, LLM_TIMEOUT
+from core.models import classify_titles
+
 logger = logging.getLogger(__name__)
 
 # ─── Configuration ────────────────────────────────────────────────────────────
@@ -34,7 +41,6 @@ logger = logging.getLogger(__name__)
 FINNHUB_API_KEY   = os.getenv("FINNHUB_API_KEY")
 NEWSAPI_KEY       = os.getenv("NEWSAPI_KEY")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-
 
 # Mots-clés de recherche par ETF
 ETF_KEYWORDS = {
@@ -58,87 +64,81 @@ MACRO_WEIGHT_BY_HORIZON = {
     "vlong":  0.05,
 }
 
-MAX_ARTICLES_PER_ETF = 20   # Articles collectés avant filtrage FinBERT
+MAX_ARTICLES_PER_ETF = 20   # Articles conservés avant filtrage FinBERT
 TOP_ARTICLES_FOR_LLM = 5    # Articles envoyés à Claude Haiku
-FINNHUB_DELAY        = 0.5  # Délai entre appels Finnhub (rate limit)
 
 
-# ─── 1. Collecte des actualités ───────────────────────────────────────────────
+# ─── 1. Collecte des actualités (asynchrone) ─────────────────────────────────
 
-def _fetch_finnhub(keyword: str, days_back: int = 7) -> list[dict]:
+async def _fetch_finnhub_general(client: httpx.AsyncClient,
+                                 days_back: int = 7) -> list[dict]:
     """
-    Collecte les actualités depuis Finnhub.
-    Plan gratuit : 60 appels/minute.
+    Récupère le flux d'actualités générales Finnhub UNE SEULE FOIS.
+
+    L'endpoint /news?category=general renvoie le même corpus quel que soit
+    l'ETF — l'ancien code l'appelait 10 fois avec un sleep de 0.5s entre
+    chaque appel. Un appel unique, filtré ensuite par mots-clés, suffit.
     """
     if not FINNHUB_API_KEY:
-        logger.warning("[Agent 2] Clé Finnhub manquante.")
+        logger.warning("[Agent 2] FINNHUB_API_KEY absente du .env — Finnhub ignoré.")
         return []
 
     date_from = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
     date_to   = datetime.now().strftime("%Y-%m-%d")
 
     try:
-        response = requests.get(
+        response = await client.get(
             "https://finnhub.io/api/v1/news",
-            params  = {"category": "general", "from": date_from,
-                       "to": date_to, "token": FINNHUB_API_KEY},
-            timeout = 10,
+            params={"category": "general", "from": date_from,
+                    "to": date_to, "token": FINNHUB_API_KEY},
         )
         response.raise_for_status()
-        articles = response.json()
-
-        keyword_lower = keyword.lower()
-        filtered = [
-            {
-                "title" : a.get("headline", ""),
-                "source": "finnhub",
-                "date"  : datetime.fromtimestamp(a.get("datetime", 0)).strftime("%Y-%m-%d"),
-                "url"   : a.get("url", ""),
-            }
-            for a in articles
-            if keyword_lower in a.get("headline", "").lower()
-            or keyword_lower in a.get("summary", "").lower()
-        ]
-
-        time.sleep(FINNHUB_DELAY)
-        return filtered[:MAX_ARTICLES_PER_ETF]
-
+        return response.json()
     except Exception as e:
-        logger.warning("[Agent 2] Finnhub erreur pour '%s' : %s", keyword, e)
+        logger.warning("[Agent 2] Finnhub erreur : %s", e)
         return []
 
 
-def _fetch_newsapi(keyword: str) -> list[dict]:
-    """
-    Collecte les actualités depuis NewsAPI.
-    Plan gratuit : 100 requêtes/jour — suffisant pour 10 ETFs × 3 keywords.
+def _filter_finnhub(raw_articles: list[dict], keyword: str) -> list[dict]:
+    """Filtre le corpus Finnhub global sur un mot-clé (titre ou résumé)."""
+    keyword_lower = keyword.lower()
+    filtered = [
+        {
+            "title" : a.get("headline", ""),
+            "source": "finnhub",
+            "date"  : datetime.fromtimestamp(a.get("datetime", 0)).strftime("%Y-%m-%d"),
+            "url"   : a.get("url", ""),
+        }
+        for a in raw_articles
+        if keyword_lower in a.get("headline", "").lower()
+        or keyword_lower in a.get("summary", "").lower()
+    ]
+    return filtered[:MAX_ARTICLES_PER_ETF]
 
-    Pour obtenir la clé :
-        1. Va sur newsapi.org
-        2. Clique sur 'Get API Key'
-        3. Crée un compte gratuit
-        4. Copie la clé dans ton .env : NEWSAPI_KEY=ta_cle
+
+async def _fetch_newsapi(client: httpx.AsyncClient, keyword: str) -> list[dict]:
+    """
+    Collecte les actualités depuis NewsAPI (plan gratuit : 100 requêtes/jour).
+    Clé gratuite sur newsapi.org → .env : NEWSAPI_KEY=ta_cle
     """
     if not NEWSAPI_KEY:
-        logger.warning("[Agent 2] Clé NewsAPI manquante.")
+        logger.warning("[Agent 2] NEWSAPI_KEY absente du .env — NewsAPI ignoré.")
         return []
 
     try:
-        response = requests.get(
+        response = await client.get(
             "https://newsapi.org/v2/everything",
-            params  = {
-                "q"           : f"{keyword} finance economy",
-                "language"    : "en",
-                "sortBy"      : "publishedAt",
-                "pageSize"    : 10,
-                "from"        : (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d"),
-                "apiKey"      : NEWSAPI_KEY,
+            params={
+                "q"       : f"{keyword} finance economy",
+                "language": "en",
+                "sortBy"  : "publishedAt",
+                "pageSize": 10,
+                "from"    : (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d"),
+                "apiKey"  : NEWSAPI_KEY,
             },
-            timeout = 10,
         )
         response.raise_for_status()
         articles = response.json().get("articles", [])
-
         return [
             {
                 "title" : a.get("title", ""),
@@ -149,105 +149,103 @@ def _fetch_newsapi(keyword: str) -> list[dict]:
             for a in articles
             if a.get("title") and "[Removed]" not in a.get("title", "")
         ]
-
     except Exception as e:
         logger.warning("[Agent 2] NewsAPI erreur pour '%s' : %s", keyword, e)
         return []
 
 
-def collect_news(etf_name: str) -> list[dict]:
-    """
-    Collecte et déduplique les actualités depuis Finnhub + NewsAPI.
-    """
-    keywords    = ETF_KEYWORDS.get(etf_name, [etf_name])
-    all_articles = []
-
-    for keyword in keywords:
-        all_articles.extend(_fetch_finnhub(keyword))
-        all_articles.extend(_fetch_newsapi(keyword))
-
-    # Dédupliquer par titre
+def _dedupe(articles: list[dict]) -> list[dict]:
+    """Déduplique par empreinte des 50 premiers caractères du titre."""
     seen, dedup = set(), []
-    for article in all_articles:
+    for article in articles:
         key = hashlib.md5(article["title"][:50].encode()).hexdigest()
         if key not in seen and article["title"]:
             seen.add(key)
             dedup.append(article)
-
-    logger.info("[Agent 2] %s : %d articles collectés", etf_name, len(dedup))
     return dedup
 
 
-# ─── 2. Filtrage FinBERT ──────────────────────────────────────────────────────
-
-_finbert_pipeline = None
-
-def _get_finbert():
-    """Charge FinBERT une seule fois (chargement paresseux)."""
-    global _finbert_pipeline
-    if _finbert_pipeline is None:
-        logger.info("[Agent 2] Chargement de FinBERT...")
-        _finbert_pipeline = pipeline(
-            "text-classification",
-            model      = "ProsusAI/finbert",
-            device     = -1,
-            truncation = True,
-            max_length = 512,
+async def _collect_all_news(assets: list[str]) -> dict[str, list[dict]]:
+    """
+    Collecte les actualités de TOUS les ETF en parallèle :
+    1 appel Finnhub global + 1 appel NewsAPI par ETF, tous concurrents.
+    """
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+        finnhub_task  = _fetch_finnhub_general(client)
+        newsapi_tasks = [
+            _fetch_newsapi(client, ETF_KEYWORDS.get(etf, [etf])[0])
+            for etf in assets
+        ]
+        finnhub_raw, *newsapi_results = await asyncio.gather(
+            finnhub_task, *newsapi_tasks, return_exceptions=True,
         )
-        logger.info("[Agent 2] FinBERT chargé.")
-    return _finbert_pipeline
+
+    if isinstance(finnhub_raw, Exception):
+        logger.warning("[Agent 2] Finnhub exception : %s", finnhub_raw)
+        finnhub_raw = []
+
+    news_by_etf = {}
+    for etf, newsapi_articles in zip(assets, newsapi_results):
+        if isinstance(newsapi_articles, Exception):
+            logger.warning("[Agent 2] NewsAPI exception pour %s : %s", etf, newsapi_articles)
+            newsapi_articles = []
+        keyword  = ETF_KEYWORDS.get(etf, [etf])[0]
+        articles = _filter_finnhub(finnhub_raw, keyword) + newsapi_articles
+        news_by_etf[etf] = _dedupe(articles)
+        logger.info("[Agent 2] %s : %d articles collectés", etf, len(news_by_etf[etf]))
+
+    return news_by_etf
 
 
-def score_with_finbert(articles: list[dict]) -> list[dict]:
+# ─── 2. Filtrage FinBERT (un seul batch global) ──────────────────────────────
+
+def _score_all_with_finbert(news_by_etf: dict[str, list[dict]]) -> dict[str, list[dict]]:
     """
-    Score chaque article avec FinBERT et trie par pertinence décroissante.
-    Conversion : positive → +score | negative → -score | neutral → score réduit
+    Score tous les articles de tous les ETF en UN SEUL batch FinBERT
+    (modèle partagé core/models.py), puis trie chaque ETF par signal décroissant.
+    Neutre → score réduit (×0.1 de la confiance) comme dans l'ancienne version.
     """
-    if not articles:
-        return []
+    flat: list[tuple[str, dict]] = [
+        (etf, article) for etf, articles in news_by_etf.items() for article in articles
+    ]
+    if not flat:
+        return {etf: [] for etf in news_by_etf}
 
-    finbert = _get_finbert()
-    titles  = [a["title"] for a in articles]
-
+    titles = [article["title"] for _, article in flat]
     try:
-        results = finbert(titles, batch_size=16)
+        results = classify_titles(titles)
     except Exception as e:
-        logger.warning("[Agent 2] FinBERT erreur : %s", e)
-        return articles
+        logger.warning("[Agent 2] FinBERT erreur : %s — articles non scorés.", e)
+        return news_by_etf
 
-    scored = []
-    for article, result in zip(articles, results):
+    scored_by_etf: dict[str, list[dict]] = {etf: [] for etf in news_by_etf}
+    for (etf, article), result in zip(flat, results):
         label = result["label"].lower()
         conf  = result["score"]
-
         if label == "positive":
             num_score = conf
         elif label == "negative":
             num_score = -conf
         else:
             num_score = conf * 0.1
-
-        scored.append({
+        scored_by_etf[etf].append({
             **article,
             "finbert_label": label,
             "finbert_score": round(num_score, 4),
         })
 
-    # Trier par valeur absolue décroissante
-    scored.sort(key=lambda x: abs(x["finbert_score"]), reverse=True)
-    return scored
+    for etf in scored_by_etf:
+        scored_by_etf[etf].sort(key=lambda x: abs(x.get("finbert_score", 0)), reverse=True)
+    return scored_by_etf
 
 
 # ─── 3. Stockage ChromaDB ────────────────────────────────────────────────────
 
-def store_in_chromadb(
-    etf_name   : str,
-    articles   : list[dict],
-    chroma_path: str = "./data/models/chroma",
-) -> None:
+def store_in_chromadb(etf_name: str, articles: list[dict],
+                      chroma_path: str = CHROMA_PATH) -> None:
     """
-    Stocke les articles dans ChromaDB pour recherche sémantique future.
-    Utilisé aussi par l'Agent 3 (sentiment) pour éviter de retélécharger.
+    Stocke les articles dans ChromaDB (chemin absolu unique de core/config.py).
+    L'Agent 3 relit cette collection — l'Agent 2 doit donc finir avant lui.
     """
     try:
         client     = chromadb.PersistentClient(path=chroma_path)
@@ -278,16 +276,14 @@ def store_in_chromadb(
         logger.warning("[Agent 2] ChromaDB erreur pour %s : %s", etf_name, e)
 
 
-# ─── 4. Analyse Claude Haiku ─────────────────────────────────────────────────
+# ─── 4. Analyse Claude Haiku (asynchrone) ────────────────────────────────────
 
-def analyze_with_haiku(etf_name: str, articles: list[dict]) -> str:
-    """
-    Analyse les TOP_ARTICLES_FOR_LLM meilleurs articles avec Claude Haiku.
-    Retourne une analyse structurée avec un score macro justifié.
-    """
-    if not ANTHROPIC_API_KEY:
-        logger.warning("[Agent 2] Clé Anthropic manquante.")
-        return f"Analyse indisponible pour {etf_name}."
+async def _analyze_with_haiku(anthropic: AsyncAnthropic | None,
+                              etf_name: str, articles: list[dict]) -> str:
+    """Analyse les meilleurs articles avec Claude Haiku (appel async)."""
+    if anthropic is None:
+        return (f"Analyse indisponible pour {etf_name} : "
+                "ANTHROPIC_API_KEY absente du fichier .env.")
 
     if not articles:
         return f"Aucune actualité disponible pour {etf_name}."
@@ -320,14 +316,12 @@ JUSTIFICATION DU SCORE :
 [1-2 phrases justifiant le score]"""
 
     try:
-        client   = Anthropic(api_key=ANTHROPIC_API_KEY)
-        response = client.messages.create(
+        response = await anthropic.messages.create(
             model      = "claude-haiku-4-5",
             max_tokens = 400,
             messages   = [{"role": "user", "content": prompt}],
         )
         return response.content[0].text
-
     except Exception as e:
         logger.error("[Agent 2] Claude Haiku erreur pour %s : %s", etf_name, e)
         return f"Analyse échouée pour {etf_name} : {e}"
@@ -335,7 +329,6 @@ JUSTIFICATION DU SCORE :
 
 def _extract_score(analysis_text: str) -> float:
     """Extrait le score numérique depuis la réponse de Claude Haiku."""
-    import re
     match = re.search(r"SCORE MACRO\s*:\s*([+-]?\d+\.?\d*)", analysis_text)
     if match:
         score = float(match.group(1))
@@ -343,47 +336,65 @@ def _extract_score(analysis_text: str) -> float:
     return 0.0
 
 
-# ─── 5. Pipeline complet par ETF ─────────────────────────────────────────────
+# ─── 5. Pipeline asynchrone complet ──────────────────────────────────────────
+
+async def _analyze_all_etfs(assets: list[str]) -> dict[str, dict]:
+    """
+    Pipeline complet pour tous les ETF, entièrement parallélisé :
+        collecte (async) → FinBERT (1 batch) → ChromaDB → Haiku (async gather)
+    """
+    # Étapes 1-2 — Collecte parallèle puis scoring FinBERT global.
+    # FinBERT est CPU-bound : on le sort de la boucle d'événements.
+    news_by_etf   = await _collect_all_news(assets)
+    scored_by_etf = await asyncio.to_thread(_score_all_with_finbert, news_by_etf)
+
+    # Étape 3 — Stockage ChromaDB (I/O disque, hors event loop)
+    for etf, articles in scored_by_etf.items():
+        if articles:
+            await asyncio.to_thread(store_in_chromadb, etf, articles)
+
+    # Étape 4 — Analyses Haiku en parallèle
+    anthropic = None
+    if ANTHROPIC_API_KEY:
+        anthropic = AsyncAnthropic(api_key=ANTHROPIC_API_KEY, timeout=LLM_TIMEOUT)
+    else:
+        logger.warning("[Agent 2] ANTHROPIC_API_KEY absente du .env — "
+                       "les analyses LLM seront vides.")
+
+    analyses = await asyncio.gather(
+        *[_analyze_with_haiku(anthropic, etf, scored_by_etf.get(etf, []))
+          for etf in assets],
+        return_exceptions=True,
+    )
+
+    results = {}
+    for etf, analysis in zip(assets, analyses):
+        if isinstance(analysis, Exception):
+            logger.error("[Agent 2] Analyse %s exception : %s", etf, analysis)
+            analysis = f"Analyse échouée pour {etf} : {analysis}"
+        articles = scored_by_etf.get(etf, [])
+        score    = _extract_score(analysis)
+        logger.info("[Agent 2] %s → score macro : %.2f", etf, score)
+        results[etf] = {
+            "score"     : score,
+            "analysis"  : analysis,
+            "n_articles": len(articles),
+            "top_titles": [a["title"] for a in articles[:TOP_ARTICLES_FOR_LLM]],
+        }
+    return results
+
 
 def analyze_etf(etf_name: str) -> dict:
     """
-    Pipeline complet pour un ETF :
-    collecte → FinBERT → ChromaDB → Haiku → score
+    Pipeline complet pour UN ETF (compatibilité test_pipeline.py).
     """
-    logger.info("[Agent 2] Analyse de %s...", etf_name)
-
-    # Étape 1 — Collecte
-    articles = collect_news(etf_name)
-    if not articles:
-        logger.warning("[Agent 2] %s : aucun article collecté.", etf_name)
-        return {"score": 0.0, "analysis": "Aucune actualité disponible.", "n_articles": 0}
-
-    # Étape 2 — Filtrage FinBERT
-    scored_articles = score_with_finbert(articles)
-
-    # Étape 3 — Stockage ChromaDB
-    store_in_chromadb(etf_name, scored_articles)
-
-    # Étape 4 — Analyse Claude Haiku
-    analysis = analyze_with_haiku(etf_name, scored_articles)
-
-    # Étape 5 — Extraction du score
-    score = _extract_score(analysis)
-
-    logger.info("[Agent 2] %s → score macro : %.2f", etf_name, score)
-
-    return {
-        "score"     : score,
-        "analysis"  : analysis,
-        "n_articles": len(articles),
-        "top_titles": [a["title"] for a in scored_articles[:TOP_ARTICLES_FOR_LLM]],
-    }
+    return asyncio.run(_analyze_all_etfs([etf_name]))[etf_name]
 
 
 # ─── Nœud LangGraph ──────────────────────────────────────────────────────────
 
 def fundamental_node(state: AgentState) -> dict:
-    """Agent 2 — Nœud LangGraph."""
+    """Agent 2 — Nœud LangGraph (synchrone, boucle asyncio interne)."""
     print("--- [Agent 2] Analyse macro-économique ---")
 
     assets       = state.get("assets") or list(ETF_KEYWORDS.keys())
@@ -391,11 +402,13 @@ def fundamental_node(state: AgentState) -> dict:
     horizon      = user_profile.get("horizon", "medium")
     macro_weight = MACRO_WEIGHT_BY_HORIZON.get(horizon, 0.25)
 
-    # Analyser chaque ETF
-    results = {}
-    for etf_name in assets:
-        if etf_name in ETF_KEYWORDS:
-            results[etf_name] = analyze_etf(etf_name)
+    # Les 10 ETF sont traités en concurrent. asyncio.run est sûr ici :
+    # ce nœud tourne dans un thread d'executor sans boucle existante.
+    try:
+        results = asyncio.run(_analyze_all_etfs(assets))
+    except Exception as e:
+        logger.error("[Agent 2] Pipeline macro échoué : %s", e)
+        results = {}
 
     # Scores et pondération
     scores   = {k: v["score"] for k, v in results.items()}
@@ -404,8 +417,8 @@ def fundamental_node(state: AgentState) -> dict:
 
     print(f"[Agent 2] Score macro moyen : {avg:.2f} | Poids horizon ({horizon}) : {macro_weight}")
     for etf, score in scores.items():
-        emoji = "🟢" if score > 0.2 else "🔴" if score < -0.2 else "🟡"
-        print(f"  {emoji} {etf:<26} {score:+.2f}")
+        tag = "[+]" if score > 0.2 else "[-]" if score < -0.2 else "[=]"
+        print(f"  {tag} {etf:<26} {score:+.2f}")
 
     return {
         "macro_context": {

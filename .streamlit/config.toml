@@ -1,0 +1,11 @@
+# Thème Wisevest — palette sobre finance : bleu nuit / gris ardoise, un seul accent.
+[theme]
+base = "light"
+primaryColor = "#1c5cab"             # accent unique (bleu 550)
+backgroundColor = "#fcfcfb"          # surface principale
+secondaryBackgroundColor = "#f2f3f0" # cartes, champs de saisie
+textColor = "#1a1d23"                # encre primaire
+font = "sans serif"
+
+[server]
+headless = true

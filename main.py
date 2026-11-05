@@ -1,15 +1,19 @@
 """
-main.py — Orchestrateur principal du système Multi-Agents P26
+main.py — Orchestrateur principal du système Multi-Agents Wisevest (P26)
 
-Optimisations vs version originale :
-    1. Agents 2, 3 et 4 tournent en PARALLÈLE après l'Agent 1
-       (asyncio.gather — pas de threads, pas de GIL)
-    2. Timeout global par agent (120s) — évite les blocages infinis
-    3. FinBERT chargé une seule fois et partagé entre Agent 2 et 3
-    4. Fallback gracieux : si un agent échoue, le pipeline continue
-    5. Chronomètre par agent pour identifier les goulots
+Architecture d'exécution :
+    1. Ordre strict des dépendances :
+       Agent 1 → Agent 2 → (Agent 3 ∥ Agent 4) → Agent 5
+       L'Agent 3 lit ChromaDB écrit par l'Agent 2 — jamais en parallèle entre eux.
+    2. Les boucles INTERNES des Agents 2 et 3 traitent les 10 ETF en
+       concurrent (httpx.AsyncClient + AsyncAnthropic + asyncio.gather).
+    3. FinBERT chargé une seule fois (singleton core/models.py) ; l'Agent 3
+       réutilise les scores stockés dans ChromaDB sans re-scorer.
+    4. Timeout global par agent (120s) + fallback gracieux : si un agent
+       échoue, le pipeline continue avec un résultat vide.
+    5. Chronomètre par agent + timing total en fin de pipeline.
 
-Temps estimé : ~80-120s (vs ~900s séquentiel)
+Objectif : pipeline complet < 60s (vs 300-900s en séquentiel).
 """
 
 import sys
@@ -17,6 +21,15 @@ import asyncio
 import time
 import logging
 from pathlib import Path
+
+# Console Windows en cp1252 : sans cela, le premier caractère non-ASCII
+# imprimé (cadres, accents) lève UnicodeEncodeError et tue le pipeline.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -32,8 +45,9 @@ logging.basicConfig(
     format = "%(asctime)s | %(levelname)s | %(message)s",
 )
 
-# Timeout maximum par agent (secondes)
-AGENT_TIMEOUT = 120
+# Timeout maximum par agent (secondes) — couvre le premier chargement
+# de FinBERT sur machines à faible RAM (le modèle est ensuite en cache)
+AGENT_TIMEOUT = 180
 
 
 # ─── Wrappers asynchrones ─────────────────────────────────────────────────────
@@ -94,8 +108,15 @@ async def _run_pipeline(initial_state: dict) -> dict:
     t_start = time.time()
 
     print("\n" + "═" * 60)
-    print("  PIPELINE MULTI-AGENTS P26")
+    print("  PIPELINE MULTI-AGENTS WISEVEST")
     print("═" * 60)
+
+    # Préchauffage FinBERT en tâche de fond : le chargement du modèle
+    # (goulot principal sur machine contrainte) recouvre l'Agent 1 et la
+    # collecte réseau de l'Agent 2 au lieu de s'ajouter à leur durée.
+    loop = asyncio.get_event_loop()
+    from core.models import get_finbert
+    loop.run_in_executor(None, get_finbert)
 
     # ── Étape 1 : Agent 1 — Collecte des données ─────────────────────────────
     print("\n[1/4] Agent 1 — Collecte des données de marché...")

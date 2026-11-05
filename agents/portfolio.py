@@ -45,16 +45,17 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from anthropic import Anthropic
 from dotenv import load_dotenv
+
+load_dotenv()   # AVANT tout os.getenv
+
 from core.state import AgentState
+from core.config import RF_ANNUAL
 
 warnings.filterwarnings("ignore")
 logger = logging.getLogger(__name__)
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 
-load_dotenv()
-warnings.filterwarnings("ignore")
-logger = logging.getLogger(__name__)
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
 # Contraintes de poids par profil (min%, max% par actif)
@@ -411,7 +412,7 @@ def _portfolio_metrics(
     assets       : list[str],
     cov_matrix   : np.ndarray,
     mean_returns : np.ndarray,
-    rf_annual    : float = 0.043,
+    rf_annual    : float = RF_ANNUAL,
 ) -> dict:
     """Calcule les métriques clés du portefeuille optimisé."""
     port_var     = float(weights @ cov_matrix @ weights)
@@ -606,19 +607,30 @@ def run_portfolio_optimization(state: dict) -> dict:
                           ("robust_optim", w_robust, var_robust)]:
         print(f"[Agent 5] {name:<22} {var:>10.4f} {np.sqrt(var)*100:>9.2f}%")
 
-    # Sélection de la méthode : MVP si robust ≈ MVP, sinon Robust
-    if abs(var_robust - var_mvp) / max(var_mvp, 1e-10) < 0.05:
+    # Sélection de la méthode selon le profil KYC :
+    #   Prudent    → toujours Minimum Variance (le plus conservateur)
+    #   Dynamique  → toujours Robust Optimization (κ=0.3, orienté rendement)
+    #   Équilibré  → comparaison des variances des deux solutions
+    if profil == "Prudent":
+        w_final     = w_mvp
+        method_used = "Minimum Variance"
+        print(f"\n[Agent 5] → Méthode retenue : Minimum Variance (profil Prudent)")
+    elif profil == "Dynamique":
+        w_final     = w_robust
+        method_used = "Robust Optimization"
+        print(f"\n[Agent 5] → Méthode retenue : Robust Optimization (profil Dynamique, κ={kappa})")
+    elif abs(var_robust - var_mvp) / max(var_mvp, 1e-10) < 0.05:
         # Les deux convergent vers la même solution → MVP
-        w_final   = w_mvp
+        w_final     = w_mvp
         method_used = "Minimum Variance"
         print(f"\n[Agent 5] → Méthode retenue : Minimum Variance (Robust ≈ MVP)")
     elif var_robust < var_mvp:
         # Robust donne moins de variance → meilleure solution
-        w_final   = w_robust
+        w_final     = w_robust
         method_used = "Robust Optimization"
         print(f"\n[Agent 5] → Méthode retenue : Robust Optimization")
     else:
-        w_final   = w_mvp
+        w_final     = w_mvp
         method_used = "Minimum Variance"
         print(f"\n[Agent 5] → Méthode retenue : Minimum Variance (plus stable)")
 

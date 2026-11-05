@@ -2,6 +2,7 @@
 data/*.csv
 data/*.parquet
 data/database/
+data/models/
 
 # Environnement Python
 .venv/
@@ -14,6 +15,7 @@ build/
 # Variables d'environnement et secrets
 .env
 .env.*
+!.env.example
 *.key
 
 # IDE
@@ -28,3 +30,6 @@ htmlcov/
 # OS
 .DS_Store
 Thumbs.db
+
+# Cahier de charges (confidentiel)
+cahier de charge PE TM P26_2.pdf

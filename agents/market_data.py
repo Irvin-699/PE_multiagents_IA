@@ -11,34 +11,17 @@ Fonctionnement :
 
 import time
 import logging
-from pathlib import Path
 
 import pandas as pd
 import yfinance as yf
 
 from core.state import AgentState
+from core.config import TICKERS, START_DATE, PARQUET_PATH, CSV_PATH, HTTP_TIMEOUT
 
 logger = logging.getLogger(__name__)
 
-# ─── Configuration ────────────────────────────────────────────────────────────
-
-TICKERS = {
-    "Nasdaq-100":           "^NDX",
-    "MSCI EM IMI":          "EIMI.L",
-    "STOXX Eur600 Finance": "EXH2.DE",
-    "Global Healthcare":    "IXJ",
-    "US Treasury 10+Y":     "LUTR.L",
-    "Bund 1-3Y":            "DBXP.DE",
-    "Clean Energy":         "ICLN",
-    "Global REITs":         "EPRA.PA",
-    "Gold":                 "GLD",
-    "Bitcoin":              "BTC-USD",
-}
-
-ANALYSIS_START = "2016-01-01"
-
-PARQUET_PATH = Path(__file__).parent.parent / "data" / "portfolio_daily.parquet"
-CSV_PATH     = Path(__file__).parent.parent / "data" / "portfolio_daily.csv"
+# Période d'analyse — source unique : core/config.py
+ANALYSIS_START = START_DATE
 
 
 # ─── Fonctions ────────────────────────────────────────────────────────────────
@@ -103,6 +86,7 @@ def update_prices(prices: pd.DataFrame) -> pd.DataFrame:
                 end         = end,
                 auto_adjust = True,
                 progress    = False,
+                timeout     = HTTP_TIMEOUT,
             )
 
             if raw.empty:

@@ -24,11 +24,9 @@ from scipy.stats import median_abs_deviation
 from sklearn.covariance import LedoitWolf
 
 from core.state import AgentState
+from core.config import RF_ANNUAL
 
 logger = logging.getLogger(__name__)
-
-# Taux sans risque annuel (T-Bills US 3 mois, mai 2025)
-RF_ANNUAL = 0.043
 
 
 # ─── 1. Nettoyage des prix ────────────────────────────────────────────────────
@@ -72,11 +70,10 @@ def _empirical_covariance(log_returns: pd.DataFrame) -> np.ndarray:
     return log_returns.cov().values * 12   # Annualisation mensuelle × 12
 
 
-def _ledoit_wolf(matrix_daily: np.ndarray,
-                 log_returns: pd.DataFrame) -> tuple[np.ndarray, float]:
+def _ledoit_wolf(log_returns: pd.DataFrame) -> tuple[np.ndarray, float]:
     """
-    Méthode 2 - Ledoit-Wolf linéaire appliqué sur une matrice d'entrée.
-
+    Méthode 2 — Ledoit-Wolf linéaire estimé sur les log-rendements.
+    α est calculé automatiquement par sklearn (formule analytique 2004).
     """
     lw = LedoitWolf(store_precision=False, assume_centered=False)
     lw.fit(log_returns.values)
@@ -105,14 +102,11 @@ def _tyler_fixed_point(log_returns: pd.DataFrame,
             logger.warning("[Tyler] Matrice singulière à l'itération %d — arrêt.", iteration)
             break
 
-        Sigma_new = np.zeros((p, p))
-        for i in range(n):
-            xi     = X[i, :]
-            mahal  = float(xi @ Sigma_inv @ xi)   # Distance de Mahalanobis²
-            if mahal < 1e-10:
-                continue
-            weight = 1.0 / mahal                   # Poids adaptatif
-            Sigma_new += weight * np.outer(xi, xi)
+        # Distances de Mahalanobis² de toutes les observations d'un coup,
+        # puis somme pondérée des produits extérieurs : Σ wᵢ·xᵢxᵢᵀ = (X·w)ᵀX
+        mahal   = np.einsum("ij,jk,ik->i", X, Sigma_inv, X)
+        weights = np.where(mahal > 1e-10, 1.0 / np.maximum(mahal, 1e-10), 0.0)
+        Sigma_new = (X * weights[:, None]).T @ X
 
         # Normalisation (trace = p) pour assurer l'unicité de la solution
         Sigma_new = (p / n) * Sigma_new
@@ -169,7 +163,7 @@ def _compute_covariances(log_returns: pd.DataFrame) -> dict[str, dict]:
 
     # ── Méthode 2 : Ledoit-Wolf sur covariance empirique ────────────────────
     # sklearn calcule α automatiquement à partir des données brutes
-    lw_emp, alpha_emp = _ledoit_wolf(emp, log_returns)
+    lw_emp, alpha_emp = _ledoit_wolf(log_returns)
     results["ledoit_wolf_emp"] = {"matrix": lw_emp, "alpha": alpha_emp}
 
     # ── Méthode 3 : Estimateur de point fixe (Tyler) ────────────────────────

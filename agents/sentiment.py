@@ -1,46 +1,48 @@
 """
 agents/sentiment.py
-Agent 3 — Analyste Sentimental
+Agent 3 — Analyste Sentimental (version asynchrone)
 
 Rôle dans le pipeline LangGraph :
-    Analyse le sentiment des investisseurs pour chaque ETF du portefeuille
-    à partir des actualités déjà stockées dans ChromaDB par l'Agent 2.
+    Analyse le sentiment des investisseurs pour chaque ETF à partir des
+    actualités déjà stockées dans ChromaDB par l'Agent 2.
     Retourne un score sentiment par ETF dans AgentState.sentiment_score.
 
 Ce que l'Agent 3 mesure :
     Pas les faits économiques (c'est l'Agent 2) mais ce que les investisseurs
     PENSENT et RESSENTENT — leurs peurs, espoirs, anticipations et doutes.
-    On part des textes bruts et on construit notre propre estimation du sentiment
-    via FinBERT + Claude Haiku.
 
 Pipeline :
-    1. Requête ChromaDB  → récupère les articles de l'Agent 2
+    1. Requête ChromaDB    → récupère les articles de l'Agent 2
+                             (avec leurs scores FinBERT déjà calculés —
+                             aucun re-scoring, le modèle n'est pas rechargé)
     2. Filtrage sémantique → garde uniquement les articles avec marqueurs
                              de sentiment (verbes d'émotion et de pensée)
-    3. FinBERT           → score sentiment brut sur chaque article
-    4. Claude Haiku      → synthèse et score final -1 à +1 par ETF
+    3. Claude Haiku        → synthèse et score final -1 à +1 par ETF
+                             (10 ETF en parallèle via AsyncAnthropic)
 
-LLM : Claude 3.5 Haiku (~5€/mois, budget partagé avec Agent 2)
+Dépendance stricte : l'Agent 2 écrit ChromaDB, cet agent le lit.
+Ils ne doivent JAMAIS tourner en parallèle entre eux.
 """
 
 import os
 import re
+import asyncio
 import logging
 
 import chromadb
-from anthropic import Anthropic
-from transformers import pipeline
+from anthropic import AsyncAnthropic
 from dotenv import load_dotenv
 
-from core.state import AgentState
+load_dotenv()   # AVANT tout os.getenv
 
-load_dotenv()
+from core.state import AgentState
+from core.config import CHROMA_PATH, LLM_TIMEOUT
+
 logger = logging.getLogger(__name__)
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-CHROMA_PATH       = "./data/models/chroma"
 TOP_ARTICLES      = 5     # Articles envoyés à Claude Haiku par ETF
 
 # Pondération du score sentiment selon l'horizon d'investissement
@@ -93,15 +95,17 @@ SENTIMENT_MARKERS = [
 
 def _query_chromadb(etf_name: str, n_results: int = 30) -> list[dict]:
     """
-    Récupère les articles de l'ETF depuis ChromaDB (alimenté par l'Agent 2).
-    Fait une requête sémantique avec des termes de sentiment pour cibler
-    les articles les plus pertinents pour l'analyse émotionnelle.
+    Récupère les articles de l'ETF depuis ChromaDB (alimenté par l'Agent 2),
+    avec leurs scores FinBERT déjà présents dans les métadonnées.
     """
     try:
         client     = chromadb.PersistentClient(path=CHROMA_PATH)
         collection = client.get_or_create_collection("financial_news")
 
-        # Requête sémantique — on cherche les articles proches du "sentiment investisseur"
+        if collection.count() == 0:
+            return []
+
+        # Requête sémantique — articles proches du "sentiment investisseur"
         query = f"investor sentiment fear hope worry expect {etf_name}"
 
         results = collection.query(
@@ -162,80 +166,39 @@ def _filter_sentiment_articles(articles: list[dict]) -> list[dict]:
     return filtered
 
 
-# ─── 3. Re-scoring FinBERT sur les articles filtrés ──────────────────────────
-
-_finbert_pipeline = None
-
-def _get_finbert():
-    """Charge FinBERT une seule fois (chargement paresseux)."""
-    global _finbert_pipeline
-    if _finbert_pipeline is None:
-        logger.info("[Agent 3] Chargement de FinBERT...")
-        _finbert_pipeline = pipeline(
-            "text-classification",
-            model      = "ProsusAI/finbert",
-            device     = -1,
-            truncation = True,
-            max_length = 512,
-        )
-        logger.info("[Agent 3] FinBERT chargé.")
-    return _finbert_pipeline
-
-
-def _score_with_finbert(articles: list[dict]) -> list[dict]:
+def _rank_by_stored_scores(articles: list[dict]) -> list[dict]:
     """
-    Re-score les articles avec FinBERT.
-    Même logique que l'Agent 2 mais appliquée uniquement aux articles
-    déjà filtrés par marqueurs de sentiment — le résultat est donc
-    plus représentatif de l'humeur des investisseurs.
+    Trie les articles par score FinBERT stocké dans ChromaDB (valeur absolue
+    décroissante — signaux les plus forts en premier).
+
+    Les scores ont été calculés par l'Agent 2 sur ces mêmes titres :
+    les re-scorer ici rechargerait le modèle pour un résultat identique.
     """
-    if not articles:
-        return []
-
-    finbert = _get_finbert()
-    titles  = [a["title"] for a in articles]
-
-    try:
-        results = finbert(titles, batch_size=16)
-    except Exception as e:
-        logger.warning("[Agent 3] FinBERT erreur : %s", e)
-        return articles
-
-    scored = []
-    for article, result in zip(articles, results):
-        label = result["label"].lower()
-        conf  = result["score"]
-
-        if label == "positive":
-            num_score = conf        # Sentiment positif → investisseurs optimistes
-        elif label == "negative":
-            num_score = -conf       # Sentiment négatif → investisseurs pessimistes
-        else:
-            num_score = 0.0         # Neutre → pas de signal sentiment clair
-
-        scored.append({
+    ranked = [
+        {
             **article,
-            "sentiment_label": label,
-            "sentiment_score": round(num_score, 4),
-        })
+            "sentiment_label": article.get("finbert_label", "neutral"),
+            "sentiment_score": round(float(article.get("finbert_score", 0)), 4),
+        }
+        for article in articles
+    ]
+    ranked.sort(key=lambda x: abs(x["sentiment_score"]), reverse=True)
+    return ranked
 
-    # Trier par valeur absolue décroissante — les signaux les plus forts en premier
-    scored.sort(key=lambda x: abs(x["sentiment_score"]), reverse=True)
-    return scored
 
+# ─── 3. Analyse Claude Haiku (asynchrone) ────────────────────────────────────
 
-# ─── 4. Analyse Claude Haiku ─────────────────────────────────────────────────
-
-def _analyze_with_haiku(etf_name: str, articles: list[dict]) -> str:
+async def _analyze_with_haiku(anthropic: AsyncAnthropic | None,
+                              etf_name: str, articles: list[dict]) -> str:
     """
     Synthèse Claude Haiku sur les articles sentimentaux.
 
     Le prompt est orienté exclusivement sur les émotions et pensées
     des investisseurs — pas sur les faits économiques.
     """
-    if not ANTHROPIC_API_KEY:
-        logger.warning("[Agent 3] Clé Anthropic manquante.")
-        return f"Analyse sentiment indisponible pour {etf_name}."
+    if anthropic is None:
+        return (f"Analyse sentiment indisponible pour {etf_name} : "
+                "ANTHROPIC_API_KEY absente du fichier .env.")
 
     if not articles:
         return f"Aucun article sentimental disponible pour {etf_name}."
@@ -270,14 +233,12 @@ JUSTIFICATION :
 [1-2 phrases justifiant le score en termes d'émotions et non de faits]"""
 
     try:
-        client   = Anthropic(api_key=ANTHROPIC_API_KEY)
-        response = client.messages.create(
+        response = await anthropic.messages.create(
             model      = "claude-haiku-4-5",
             max_tokens = 400,
             messages   = [{"role": "user", "content": prompt}],
         )
         return response.content[0].text
-
     except Exception as e:
         logger.error("[Agent 3] Claude Haiku erreur pour %s : %s", etf_name, e)
         return f"Analyse échouée pour {etf_name} : {e}"
@@ -292,62 +253,78 @@ def _extract_score(analysis_text: str) -> float:
     return 0.0
 
 
-# ─── Pipeline complet par ETF ─────────────────────────────────────────────────
+# ─── Pipeline asynchrone complet ──────────────────────────────────────────────
+
+async def _analyze_all_sentiments(assets: list[str]) -> dict[str, dict]:
+    """
+    Pipeline complet pour tous les ETF :
+        ChromaDB (I/O, hors event loop) → filtrage → tri par scores stockés
+        → Haiku en parallèle (asyncio.gather)
+    """
+    # Étapes 1-2 — Lecture ChromaDB + filtrage (par ETF, hors event loop)
+    prepared: dict[str, list[dict]] = {}
+    for etf in assets:
+        articles = await asyncio.to_thread(_query_chromadb, etf)
+        if not articles:
+            logger.warning("[Agent 3] %s : aucun article dans ChromaDB. "
+                           "L'Agent 2 doit tourner en premier.", etf)
+            prepared[etf] = []
+            continue
+        sentiment_articles = _filter_sentiment_articles(articles)
+        prepared[etf] = _rank_by_stored_scores(sentiment_articles)
+
+    # Étape 3 — Analyses Haiku en parallèle
+    anthropic = None
+    if ANTHROPIC_API_KEY:
+        anthropic = AsyncAnthropic(api_key=ANTHROPIC_API_KEY, timeout=LLM_TIMEOUT)
+    else:
+        logger.warning("[Agent 3] ANTHROPIC_API_KEY absente du .env — "
+                       "les analyses LLM seront vides.")
+
+    etfs_with_articles = [etf for etf in assets if prepared[etf]]
+    analyses = await asyncio.gather(
+        *[_analyze_with_haiku(anthropic, etf, prepared[etf])
+          for etf in etfs_with_articles],
+        return_exceptions=True,
+    )
+    analysis_by_etf = dict(zip(etfs_with_articles, analyses))
+
+    results = {}
+    for etf in assets:
+        articles = prepared[etf]
+        if not articles:
+            results[etf] = {
+                "score"     : 0.0,
+                "analysis"  : "Aucun article disponible — lancer l'Agent 2 d'abord.",
+                "n_articles": 0,
+            }
+            continue
+
+        analysis = analysis_by_etf.get(etf, "")
+        if isinstance(analysis, Exception):
+            logger.error("[Agent 3] Analyse %s exception : %s", etf, analysis)
+            analysis = f"Analyse échouée pour {etf} : {analysis}"
+
+        score = _extract_score(analysis)
+        logger.info("[Agent 3] %s → score sentiment : %.2f", etf, score)
+        results[etf] = {
+            "score"     : score,
+            "analysis"  : analysis,
+            "n_articles": len(articles),
+            "top_titles": [a["title"] for a in articles[:TOP_ARTICLES]],
+        }
+    return results
+
 
 def analyze_sentiment(etf_name: str) -> dict:
-    """
-    Pipeline complet pour un ETF :
-        ChromaDB → filtrage sémantique → FinBERT → Haiku → score
-    """
-    logger.info("[Agent 3] Analyse sentiment de %s...", etf_name)
-
-    # Étape 1 — Récupération depuis ChromaDB
-    articles = _query_chromadb(etf_name)
-
-    if not articles:
-        logger.warning("[Agent 3] %s : aucun article dans ChromaDB. "
-                       "L'Agent 2 doit tourner en premier.", etf_name)
-        return {
-            "score"     : 0.0,
-            "analysis"  : "Aucun article disponible — lancer l'Agent 2 d'abord.",
-            "n_articles": 0,
-        }
-
-    # Étape 2 — Filtrage par marqueurs de sentiment
-    sentiment_articles = _filter_sentiment_articles(articles)
-
-    # Si aucun article sentimental trouvé — score neutre
-    if not sentiment_articles:
-        logger.info("[Agent 3] %s : aucun article sentimental — score neutre.", etf_name)
-        return {
-            "score"     : 0.0,
-            "analysis"  : "Aucun article sentimental détecté — sentiment neutre.",
-            "n_articles": 0,
-        }
-
-    # Étape 3 — Re-scoring FinBERT
-    scored_articles = _score_with_finbert(sentiment_articles)
-
-    # Étape 4 — Analyse Claude Haiku
-    analysis = _analyze_with_haiku(etf_name, scored_articles)
-
-    # Extraction du score
-    score = _extract_score(analysis)
-
-    logger.info("[Agent 3] %s → score sentiment : %.2f", etf_name, score)
-
-    return {
-        "score"     : score,
-        "analysis"  : analysis,
-        "n_articles": len(sentiment_articles),
-        "top_titles": [a["title"] for a in scored_articles[:TOP_ARTICLES]],
-    }
+    """Pipeline complet pour UN ETF (compatibilité tests)."""
+    return asyncio.run(_analyze_all_sentiments([etf_name]))[etf_name]
 
 
 # ─── Nœud LangGraph ──────────────────────────────────────────────────────────
 
 def sentiment_node(state: AgentState) -> dict:
-    """Agent 3 — Nœud LangGraph."""
+    """Agent 3 — Nœud LangGraph (synchrone, boucle asyncio interne)."""
     print("--- [Agent 3] Analyse sentimentale ---")
 
     assets       = state.get("assets") or []
@@ -355,10 +332,12 @@ def sentiment_node(state: AgentState) -> dict:
     horizon      = user_profile.get("horizon", "medium")
     sent_weight  = SENTIMENT_WEIGHT_BY_HORIZON.get(horizon, 0.20)
 
-    # Analyser le sentiment pour chaque ETF
-    results = {}
-    for etf_name in assets:
-        results[etf_name] = analyze_sentiment(etf_name)
+    # Les 10 ETF sont traités en concurrent (voir note dans fundamental.py)
+    try:
+        results = asyncio.run(_analyze_all_sentiments(assets))
+    except Exception as e:
+        logger.error("[Agent 3] Pipeline sentiment échoué : %s", e)
+        results = {}
 
     # Scores et pondération par horizon
     scores   = {k: v["score"] for k, v in results.items()}
@@ -368,8 +347,8 @@ def sentiment_node(state: AgentState) -> dict:
     print(f"[Agent 3] Score sentiment moyen : {avg:.2f} | "
           f"Poids horizon ({horizon}) : {sent_weight}")
     for etf, score in scores.items():
-        emoji = "🟢" if score > 0.2 else "🔴" if score < -0.2 else "🟡"
-        print(f"  {emoji} {etf:<26} {score:+.2f}")
+        tag = "[+]" if score > 0.2 else "[-]" if score < -0.2 else "[=]"
+        print(f"  {tag} {etf:<26} {score:+.2f}")
 
     return {
         "sentiment_score": {

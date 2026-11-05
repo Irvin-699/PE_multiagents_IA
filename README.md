@@ -1,4 +1,4 @@
-# FinAgent P26 — Système Multi-Agents de Conseil en Investissement
+# Wisevest — Système Multi-Agents de Conseil en Investissement (P26)
 
 Système d'intelligence artificielle qui génère une recommandation de portefeuille personnalisée à partir du profil investisseur d'un utilisateur. Cinq agents spécialisés collaborent en pipeline pour analyser les marchés, l'actualité financière et le sentiment des investisseurs, puis optimisent mathématiquement l'allocation.
 
