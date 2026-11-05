@@ -1,8 +1,3 @@
-# Données générées
-data/*.csv
-data/*.parquet
-data/database/
-data/models/
 
 # Environnement Python
 .venv/
